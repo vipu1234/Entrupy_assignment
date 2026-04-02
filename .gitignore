@@ -1,0 +1,23 @@
+# Environments
+venv/
+env/
+.env
+__pycache__/
+*.pyc
+
+# Database
+*.db
+*.sqlite3
+sql_app.db
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.env*
+
+# IDEs
+.idea/
+.vscode/
+
+# Ignore testing caches
+.pytest_cache/
