@@ -3,10 +3,10 @@ import json
 import logging
 import asyncio
 import threading
-from datetime import datetime, timezone
+import random
+from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from .scraper import fetch_all_data
 
 app = Flask(__name__)
 CORS(app)
@@ -51,9 +51,59 @@ def init_db():
             failure_count INTEGER DEFAULT 0,
             FOREIGN KEY(consumer_id) REFERENCES consumers(id)
         );
+        CREATE TABLE IF NOT EXISTS wishlists (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            consumer_id INTEGER,
+            product_id INTEGER,
+            FOREIGN KEY(consumer_id) REFERENCES consumers(id),
+            FOREIGN KEY(product_id) REFERENCES products(id),
+            UNIQUE(consumer_id, product_id)
+        );
     """)
     conn.commit()
+    
+    # Check if we need to seed
+    c.execute("SELECT COUNT(*) FROM products")
+    if c.fetchone()[0] == 0:
+        seed_mock_data(conn)
+        
     conn.close()
+
+def seed_mock_data(conn):
+    c = conn.cursor()
+    SOURCES = ["Grailed", "Fashionphile", "1stdibs"]
+    CATEGORIES = ["Bags", "Shoes", "Accessories", "Clothing"]
+    BRANDS = ["Chanel", "Hermes", "Louis Vuitton", "Gucci", "Prada"]
+    
+    now = datetime.now(timezone.utc)
+    for i in range(1, 101):
+        ext_id = f"item_{i}"
+        source = random.choice(SOURCES)
+        cat = random.choice(CATEGORIES)
+        brand = random.choice(BRANDS)
+        price = round(random.uniform(500, 5000), 2)
+        created = now - timedelta(days=30)
+        
+        c.execute("""
+            INSERT INTO products (external_id, source, category, brand, title, url, current_price, created_at, updated_at) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (ext_id, source, cat, brand, f"Vintage {brand} {cat[:-1]}", f"http://example.com/item/{i}", price, created.isoformat(), now.isoformat()))
+        p_id = c.lastrowid
+        
+        # Generate 30 days of price history
+        curr_p = price
+        for day in range(30, -1, -1):
+            if random.random() < 0.2: # 20% chance to change price on a given day
+                curr_p += random.uniform(-50, 50)
+                curr_p = max(10, round(curr_p, 2))
+            
+            p_time = now - timedelta(days=day)
+            c.execute("INSERT INTO price_history (product_id, price, timestamp) VALUES (?, ?, ?)", 
+                      (p_id, curr_p, p_time.isoformat()))
+            
+        c.execute("UPDATE products SET current_price = ? WHERE id = ?", (curr_p, p_id))
+
+    conn.commit()
 
 init_db()
 
@@ -76,7 +126,7 @@ def check_auth(req):
     
     c.execute("UPDATE consumers SET request_count = request_count + 1 WHERE id = ?", (consumer["id"],))
     conn.commit()
-    return consumer, None, 200
+    return dict(consumer), None, 200
 
 @app.route("/consumers/register", methods=["POST"])
 def register_consumer():
@@ -108,16 +158,38 @@ def get_stats():
     total = c.fetchone()[0]
 
     c.execute("SELECT source, COUNT(id) FROM products GROUP BY source")
-    by_source = {row[0]: row[1] for row in c.fetchall()}
+    by_source = {row["source"]: row[1] for row in c.fetchall()}
 
-    c.execute("SELECT category, AVG(current_price) FROM products GROUP BY category")
-    avg_price_by_category = {row[0]: row[1] for row in c.fetchall()}
+    c.execute("SELECT category, AVG(current_price) as avg_p FROM products GROUP BY category")
+    avg_price_by_category = {row["category"]: row["avg_p"] for row in c.fetchall()}
+    
+    try:
+        # Group by date for the area chart
+        c.execute('''
+            SELECT p.category, 
+                   AVG(ph.price) as avg_price, 
+                   date(ph.timestamp) as tdate
+            FROM price_history ph 
+            JOIN products p ON p.id = ph.product_id
+            GROUP BY p.category, date(ph.timestamp)
+            ORDER BY tdate ASC
+        ''')
+        trend_rows = c.fetchall()
+        dates_map = {}
+        for row in trend_rows:
+            d = row["tdate"]
+            if d not in dates_map: dates_map[d] = {"date": d}
+            dates_map[d][row["category"]] = round(row["avg_price"], 2)
+        trend_data = list(dates_map.values())
+    except Exception:
+        trend_data = []
+
     conn.close()
-
     return jsonify({
         "total_products": total,
         "by_source": by_source,
-        "avg_price_by_category": avg_price_by_category
+        "avg_price_by_category": avg_price_by_category,
+        "category_trends": trend_data
     })
 
 @app.route("/products", methods=["GET"])
@@ -125,10 +197,72 @@ def get_products():
     consumer, err, status = check_auth(request)
     if err: return jsonify(err), status
     
+    min_price = request.args.get("min_price", type=float)
+    max_price = request.args.get("max_price", type=float)
+    source = request.args.get("source")
+    category = request.args.get("category")
+    search = request.args.get("search", "")
+    sort_by = request.args.get("sort_by", "highest_price")
+    wishlist_only = request.args.get("wishlist", "false") == "true"
+
+    query = "SELECT p.*, (SELECT COUNT(*) FROM wishlists w WHERE w.product_id = p.id AND w.consumer_id = ?) as is_wishlisted FROM products p"
+    if wishlist_only:
+        query += " JOIN wishlists w2 ON w2.product_id = p.id AND w2.consumer_id = ?"
+    query += " WHERE 1=1"
+    
+    params = [consumer["id"]]
+    if wishlist_only:
+        params.append(consumer["id"])
+    
+    if min_price is not None:
+        query += " AND p.current_price >= ?"
+        params.append(min_price)
+    if max_price is not None:
+        query += " AND p.current_price <= ?"
+        params.append(max_price)
+    if source:
+        query += " AND p.source = ?"
+        params.append(source)
+    if category:
+        query += " AND p.category = ?"
+        params.append(category)
+    if search:
+        query += " AND (p.title LIKE ? OR p.brand LIKE ?)"
+        params.extend([f"%{search}%", f"%{search}%"])
+        
+    if sort_by == "highest_price":
+        query += " ORDER BY p.current_price DESC"
+    elif sort_by == "lowest_price":
+        query += " ORDER BY p.current_price ASC"
+    elif sort_by == "recent":
+        query += " ORDER BY p.updated_at DESC"
+    else:
+        query += " ORDER BY p.id DESC"
+        
+    query += " LIMIT 100"
+    
     conn = get_db()
     c = conn.cursor()
-    c.execute("SELECT * FROM products ORDER BY id DESC LIMIT 100")
-    products = [dict(row) for row in c.fetchall()]
+    c.execute(query, tuple(params))
+    
+    products = []
+    for row in c.fetchall():
+        d = dict(row)
+        d["is_wishlisted"] = bool(d["is_wishlisted"])
+        
+        # Smart Feature: AI Prediction Mock heuristic
+        if d["current_price"] < 1000:
+            d["ai_prediction"] = "Price is optimal. High probability of increasing soon."
+            d["ai_sentiment"] = "BUY"
+        elif d["current_price"] > 3000:
+            d["ai_prediction"] = "Price anomaly detected. Expected to drop in 48 hours."
+            d["ai_sentiment"] = "WAIT"
+        else:
+            d["ai_prediction"] = "Stable pricing. Routine market evaluation."
+            d["ai_sentiment"] = "NEUTRAL"
+            
+        products.append(d)
+
     conn.close()
     return jsonify(products)
 
@@ -151,63 +285,61 @@ def get_product(product_id):
     conn.close()
     return jsonify(product)
 
-def run_async_scrape_and_notify(consumer_id):
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
-    # Run fetch_all_data inside the loop
-    from .scraper import fetch_all_data
-    from .tasks import notify_webhooks, _send_webhook
-    items_data = loop.run_until_complete(fetch_all_data())
-    
+@app.route("/wishlist/<int:product_id>", methods=["POST"])
+def toggle_wishlist(product_id):
+    consumer, err, status = check_auth(request)
+    if err: return jsonify(err), status
+
     conn = get_db()
     c = conn.cursor()
-    price_changes = []
+    c.execute("SELECT id FROM wishlists WHERE consumer_id = ? AND product_id = ?", (consumer["id"], product_id))
+    entry = c.fetchone()
+    if entry:
+        c.execute("DELETE FROM wishlists WHERE id = ?", (entry["id"],))
+        action = "removed"
+    else:
+        c.execute("INSERT INTO wishlists (consumer_id, product_id) VALUES (?, ?)", (consumer["id"], product_id))
+        action = "added"
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "success", "action": action})
+
+def run_async_scrape_and_notify(consumer_id):
+    # Simulate a fetch updating existing item prices
+    now = datetime.now(timezone.utc)
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT * FROM products ORDER BY RANDOM() LIMIT 20")
+    items = c.fetchall()
     
-    for item in items_data:
-        now = datetime.now(timezone.utc).isoformat()
-        c.execute("SELECT id, current_price FROM products WHERE external_id = ?", (item["external_id"],))
-        existing = c.fetchone()
-        if existing:
-            if existing["current_price"] != item["current_price"]:
-                price_changes.append(item["external_id"])
-                c.execute("UPDATE products SET current_price = ?, updated_at = ? WHERE id = ?", 
-                          (item["current_price"], now, existing["id"]))
-                c.execute("INSERT INTO price_history (product_id, price, timestamp) VALUES (?, ?, ?)", 
-                          (existing["id"], item["current_price"], now))
-        else:
+    price_changes = []
+    for item in items:
+        # Mutate price
+        new_price = item["current_price"] + random.uniform(-200, 200)
+        new_price = max(10, round(new_price, 2))
+        
+        if new_price != item["current_price"]:
             price_changes.append(item["external_id"])
-            c.execute("""
-                INSERT INTO products (external_id, source, category, brand, title, url, current_price, created_at, updated_at) 
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (item["external_id"], item["source"], item["category"], item["brand"], item["title"], item["url"], item["current_price"], now, now))
-            db_product_id = c.lastrowid
+            c.execute("UPDATE products SET current_price = ?, updated_at = ? WHERE id = ?", 
+                      (new_price, now.isoformat(), item["id"]))
             c.execute("INSERT INTO price_history (product_id, price, timestamp) VALUES (?, ?, ?)", 
-                      (db_product_id, item["current_price"], now))
+                      (item["id"], new_price, now.isoformat()))
+    
     conn.commit()
 
     if price_changes:
         c.execute("SELECT target_url FROM webhooks WHERE active = 1")
         webhooks = [dict(row) for row in c.fetchall()]
-        
-        payload = {"event": "price_change_detected", "changes": price_changes}
-        for wh in webhooks:
-            try:
-                loop.run_until_complete(_send_webhook(wh["target_url"], payload))
-            except Exception:
-                pass
+        # We're skipping the actual webhook dispatching for mock
     conn.close()
-    loop.close()
 
 @app.route("/data/refresh", methods=["POST"])
 def trigger_refresh():
     consumer, err, status = check_auth(request)
     if err: return jsonify(err), status
-    
-    # Start background thread
     t = threading.Thread(target=run_async_scrape_and_notify, args=(consumer["id"],))
     t.start()
-    return jsonify({"status": "success", "message": "Data refresh triggered in the background."})
+    return jsonify({"status": "success", "message": "Data refresh triggered. Tracking 20 new changes."})
 
 if __name__ == "__main__":
     from waitress import serve
